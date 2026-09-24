@@ -30,6 +30,8 @@ RECHERCHES = [
 ]
 
 BASE = "https://www.vinted.fr"
+# Depuis septembre 2026, la recherche Vinted est sur un nouveau serveur
+API = "https://api.vinted.fr/svc-catalogue/items"
 FICHIER_VUS = Path("seen.json")
 MAX_VUS = 5000  # nombre d'annonces mémorisées
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
@@ -59,9 +61,18 @@ def sauver_vus(vus):
 
 
 def nouvelle_session():
+    """Récupère un jeton anonyme (cookie access_token_web) sur www.vinted.fr."""
     s = requests.Session()
     s.headers.update(HEADERS)
-    s.get(BASE, timeout=20)  # récupère les cookies nécessaires à l'API
+    r = s.head(f"{BASE}/", timeout=20, allow_redirects=True)
+    jeton = s.cookies.get("access_token_web")
+    if not jeton:  # certains serveurs ne donnent le cookie qu'avec un GET
+        s.get(f"{BASE}/", timeout=20)
+        jeton = s.cookies.get("access_token_web")
+    if jeton:
+        s.headers["Authorization"] = f"Bearer {jeton}"
+    else:
+        print(f"Attention : pas de jeton Vinted reçu (code {r.status_code}).")
     return s
 
 
@@ -70,12 +81,18 @@ def chercher(session, recherche):
         "search_text": recherche["texte"],
         "order": "newest_first",
         "per_page": 30,
+        "page": 1,
     }
-    if recherche.get("prix_max"):
+    if recherche.get("prix_max"):  # un filtre vide provoque une erreur 400
         params["price_to"] = recherche["prix_max"]
-    r = session.get(f"{BASE}/api/v2/catalog/items", params=params, timeout=20)
+    r = session.get(API, params=params, timeout=20)
     r.raise_for_status()
     return r.json().get("items", [])
+
+
+def lien(item):
+    url = item.get("url") or f"/items/{item['id']}"
+    return url if url.startswith("http") else f"{BASE}{url}"  # les liens sont désormais relatifs
 
 
 def prix(item):
@@ -90,7 +107,7 @@ def envoyer_discord(annonces, libelle):
     for it in annonces:
         embed = {
             "title": (it.get("title") or "Annonce Vinted")[:256],
-            "url": it.get("url") or f"{BASE}/items/{it['id']}",
+            "url": lien(it),
             "description": f"💶 **{prix(it)}**\n🔎 {libelle}",
             "color": 0x09B1BA,
         }
@@ -116,16 +133,16 @@ def main():
     if not WEBHOOK:
         raise SystemExit("Secret DISCORD_WEBHOOK manquant.")
 
-    premier_lancement = not FICHIER_VUS.exists()
     vus = charger_vus()
+    premier_lancement = not vus  # mémoire vide = on mémorise sans alerter
     session = nouvelle_session()
 
     for rech in RECHERCHES:
         try:
             items = chercher(session, rech)
         except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code == 401:
-                session = nouvelle_session()  # cookies expirés : on réessaie
+            if e.response is not None and e.response.status_code in (401, 403):
+                session = nouvelle_session()  # jeton expiré : on en reprend un
                 try:
                     items = chercher(session, rech)
                 except Exception as e2:
