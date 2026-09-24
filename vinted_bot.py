@@ -17,16 +17,41 @@ import requests
 # "prix_max" = prix maximum en euros (None = pas de limite)
 # ============================================================
 RECHERCHES = [
+    # --- Collections / classeurs (vendeurs qui liquident sans connaitre la valeur) ---
+    {"texte": "collection cartes pokemon", "prix_max": 80},
+    {"texte": "collection pokemon", "prix_max": 80},
+    {"texte": "classeur cartes pokemon", "prix_max": 60},
     {"texte": "lot cartes pokemon", "prix_max": 40},
-    {"texte": "classeur pokemon", "prix_max": 50},
-    {"texte": "cartes pokemon enfance", "prix_max": 40},
-    {"texte": "vieux lot pokemon", "prix_max": 50},
-    {"texte": "pokemon niveau x", "prix_max": 30},
-    {"texte": "pokemon prime", "prix_max": 30},
-    {"texte": "pokemon legende", "prix_max": 40},
-    {"texte": "lot pokemon japonais", "prix_max": 40},
-    {"texte": "pokemone", "prix_max": 40},
-    {"texte": "carte pokemen", "prix_max": 40},
+    {"texte": "cartes pokemon anciennes", "prix_max": 50},
+    # --- Cartes niveau X (Diamant & Perle / Platine) ---
+    {"texte": "pokemon niveau x", "prix_max": 15},
+    {"texte": "pokemon lv x", "prix_max": 15},
+    {"texte": "pokemon lvl x", "prix_max": 15},
+    {"texte": "lot niveau x pokemon", "prix_max": 40},
+    # --- Cartes Prime / Legende (HeartGold SoulSilver) ---
+    {"texte": "pokemon prime", "prix_max": 12},
+    {"texte": "carte prime pokemon", "prix_max": 12},
+    {"texte": "lot prime pokemon", "prix_max": 40},
+    {"texte": "pokemon legende", "prix_max": 25},
+    {"texte": "cartes pokemon heartgold soulsilver", "prix_max": 30},
+    {"texte": "cartes pokemon diamant perle", "prix_max": 30},
+]
+
+# Ne garder que les vendeurs bases en France (True / False)
+FRANCE_UNIQUEMENT = True
+
+# ============================================================
+# MOTS INTERDITS : une annonce dont le titre contient un de ces mots est ignorée
+# (en minuscules, sans accent). Ajoute ou retire des mots librement.
+# ============================================================
+EXCLURE = [
+    "peluche", "figurine", "funko", "jeu video", "switch", "nintendo ds",
+    "gameboy", "game boy", "3ds", "ds", "t-shirt", "tee-shirt", "sweat", "pyjama", "casquette",
+    "sac", "trousse", "cartable", "gourde", "puzzle", "lego", "livre", "dvd",
+    "poster", "sticker", "autocollant", "pokeball", "costume", "deguisement",
+    "boite vide", "classeur vide", "portfolio vide", "proxy", "fake",
+    "custom", "metal", "gold card", "carte doree", "tcg pocket", "code",
+    "pochette", "sleeve", "protege", "toploader",
 ]
 
 BASE = "https://www.vinted.fr"
@@ -85,9 +110,78 @@ def chercher(session, recherche):
     }
     if recherche.get("prix_max"):  # un filtre vide provoque une erreur 400
         params["price_to"] = recherche["prix_max"]
+    params["currency"] = "EUR"  # sinon l'API peut répondre en dollars
     r = session.get(API, params=params, timeout=20)
+    if r.status_code == 400:  # paramètre refusé : on réessaie sans
+        params.pop("currency")
+        r = session.get(API, params=params, timeout=20)
     r.raise_for_status()
     return r.json().get("items", [])
+
+
+PAYS_VENDEURS = {}  # mémoire des pays déjà vérifiés pendant ce lancement
+
+
+def chercher_cle(obj, cles):
+    """Cherche une clé (ex. country_iso_code) n'importe où dans un dictionnaire."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in cles and isinstance(v, str) and v:
+                return v
+            trouve = chercher_cle(v, cles)
+            if trouve:
+                return trouve
+    return None
+
+
+def pays_vendeur(session, item):
+    """Renvoie le code pays du vendeur (ex. 'FR'), ou None si inconnu."""
+    cles = {"country_iso_code", "country_code"}
+    direct = chercher_cle(item, cles)
+    if direct:
+        return direct.upper()
+    user = item.get("user") or {}
+    uid = user.get("id") or item.get("user_id")
+    if not uid:
+        return None
+    if uid in PAYS_VENDEURS:
+        return PAYS_VENDEURS[uid]
+    pays = None
+    for url in (f"{BASE}/api/v2/users/{uid}", f"https://api.vinted.fr/api/v2/users/{uid}"):
+        try:
+            r = session.get(url, timeout=15)
+            if r.ok:
+                pays = chercher_cle(r.json(), cles)
+                if pays:
+                    pays = pays.upper()
+                    break
+        except Exception:
+            continue
+        time.sleep(0.5)
+    PAYS_VENDEURS[uid] = pays
+    return pays
+
+
+def est_francaise(session, item):
+    if not FRANCE_UNIQUEMENT:
+        return True
+    pays = pays_vendeur(session, item)
+    if pays:
+        return pays == "FR"
+    # Pays inconnu : on se rabat sur la devise (les vendeurs UK/US sont en GBP/USD)
+    devise = (item.get("price") or {}).get("currency_code") if isinstance(item.get("price"), dict) else None
+    return devise in (None, "EUR")
+
+
+def sans_accent(texte):
+    import unicodedata
+    t = unicodedata.normalize("NFD", texte.lower())
+    return "".join(c for c in t if unicodedata.category(c) != "Mn")
+
+
+def est_exclue(item):
+    titre = f" {sans_accent(item.get('title') or '')} "
+    return any(f" {mot} " in titre or f" {mot}s " in titre for mot in EXCLURE)
 
 
 def lien(item):
@@ -116,17 +210,33 @@ def envoyer_discord(annonces, libelle):
             embed["image"] = {"url": photo}
         embeds.append(embed)
 
+    ok = True
     # Discord accepte 10 embeds maximum par message
     for i in range(0, len(embeds), 10):
-        r = requests.post(
-            WEBHOOK,
-            json={"username": "Sniper Pokémon", "embeds": embeds[i:i + 10]},
-            timeout=20,
-        )
+        lot = embeds[i:i + 10]
+        payload = {"username": "Sniper Pokémon", "embeds": lot}
+        r = requests.post(WEBHOOK, json=payload, timeout=20)
         if r.status_code == 429:  # trop de messages : on patiente
-            time.sleep(float(r.json().get("retry_after", 2)))
-            requests.post(WEBHOOK, json={"embeds": embeds[i:i + 10]}, timeout=20)
+            try:
+                attente = float(r.json().get("retry_after", 2))
+            except ValueError:
+                attente = 2
+            time.sleep(attente)
+            r = requests.post(WEBHOOK, json=payload, timeout=20)
+        if r.status_code == 400:  # message riche refusé : on envoie en texte simple
+            texte = "\n".join(f"{e['title']} — {e['description'].splitlines()[0]}\n{e['url']}" for e in lot)
+            r = requests.post(
+                WEBHOOK,
+                json={"username": "Sniper Pokémon", "content": texte[:1900]},
+                timeout=20,
+            )
+        if r.status_code >= 300:
+            print(f"Erreur Discord {r.status_code} : {r.text[:300]}")
+            ok = False
+        else:
+            print(f"Envoyé dans Discord : {len(lot)} annonce(s)")
         time.sleep(1)
+    return ok
 
 
 def main():
@@ -156,13 +266,25 @@ def main():
             continue
 
         nouvelles = [it for it in items if str(it["id"]) not in vus]
-        for it in nouvelles:
-            vus[str(it["id"])] = True
 
         # Au premier lancement, on mémorise sans notifier (évite 300 alertes d'un coup)
-        if nouvelles and not premier_lancement:
-            print(f"{len(nouvelles)} nouvelle(s) pour « {rech['texte']} »")
-            envoyer_discord(nouvelles, rech["texte"])
+        envoye = True
+        a_envoyer = [it for it in nouvelles if not est_exclue(it)]
+        if len(a_envoyer) < len(nouvelles):
+            print(f"{len(nouvelles) - len(a_envoyer)} annonce(s) ignorée(s) (mots interdits)")
+        if not premier_lancement:
+            avant = len(a_envoyer)
+            a_envoyer = [it for it in a_envoyer if est_francaise(session, it)]
+            if len(a_envoyer) < avant:
+                print(f"{avant - len(a_envoyer)} annonce(s) ignorée(s) (vendeur hors France)")
+        if a_envoyer and not premier_lancement:
+            print(f"{len(a_envoyer)} nouvelle(s) pour « {rech['texte']} »")
+            envoye = envoyer_discord(a_envoyer, rech["texte"])
+
+        # On ne mémorise que ce qui a bien été envoyé (sinon on réessaie au prochain passage)
+        if envoye:
+            for it in nouvelles:
+                vus[str(it["id"])] = True
 
         time.sleep(3)  # pause entre recherches pour ne pas se faire bloquer
 
